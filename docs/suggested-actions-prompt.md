@@ -1,40 +1,38 @@
-# Suggested Actions — Newton `/query` Prompt Reference
+# Suggested Actions — Newton Prompt Reference
 
-This demo uses Newton's `/query` text-reasoning endpoint to turn per-stage anomaly flags from Machine State Lens into concrete upstream / local / downstream operator actions. The prompt was iterated on heavily to keep Newton from hallucinating sensor names, collapsing to generic guidance, or mis-routing cards across the plant topology.
+This demo asks Newton C 2.6, on the Inference API, to turn per-stage anomaly flags from the Omega + KNN classifier into concrete upstream / local / downstream operator actions. The prompt was iterated on heavily to keep Newton from hallucinating sensor names, collapsing to generic guidance, or mis-routing cards across the plant topology.
 
 Use this as a template for similar "reason over structured state" use cases in other apps.
 
 ## Endpoint
 
 ```
-POST {ATAI_API_ENDPOINT}/api/lens/query
+POST {ATAI_API_ENDPOINT}/api/inference/query
 Authorization: Bearer <API_KEY>
 Content-Type: application/json
 ```
 
-We call this directly from the browser (bypassing the SvelteKit server) because our dev server was wedging on proxied `/query` calls. See `src/lib/suggestions-direct.js` for the full implementation.
+The server makes this call (`/api/suggestions`), so the API key never reaches the browser. See `src/lib/server/suggestions.js` for the prompt, query builder and parser, and `src/lib/inference-client.js` for the request.
 
 ## Request body
 
 ```json
 {
+  "model": "newton-c-2.6",
   "query": "<plant state snapshot — see below>",
-  "system_prompt": "<SYSTEM_PROMPT — see below>",
-  "instruction_prompt": "<same as system_prompt>",
-  "file_ids": [],
-  "model": "Newton::c2_4_7b_251215a172f6d7",
-  "max_new_tokens": 700,
-  "sanitize": false
+  "instruction_prompt": "<SYSTEM_PROMPT — see below>",
+  "max_new_tokens": 1500
 }
 ```
 
 Notes on the params:
 
-- **`model`** — the specific Newton checkpoint. Swap for whatever the latest `Newton::...` ID is in your account.
-- **`max_new_tokens: 700`** — enough budget for ~4 attack stages × 3 direction cards. We bumped from 500 after Newton was truncating the final card mid-sentence.
-- **`sanitize: false`** — we need the raw JSON array back; sanitizing rewrites punctuation and breaks `JSON.parse`.
-- **`system_prompt` and `instruction_prompt`** — we send the same string to both. Newton's chat template uses `instruction_prompt` as the authoritative system turn; `system_prompt` is a legacy alias. Sending both is belt-and-braces.
-- **`file_ids: []`** — no retrieval; the prompt is fully self-contained.
+- **`model`** — Newton C 2.6 by its Inference API name.
+- **`max_new_tokens: 1500`** — enough budget for every attack stage's direction cards. Smaller budgets (500, then 700) truncated the final card mid-sentence, which breaks `JSON.parse`.
+- **`instruction_prompt`** — Newton C 2.6 applies `instruction_prompt` as the system turn; the prompt goes there.
+- No files or attachments: the prompt is fully self-contained.
+
+The answer is the model's text at `response.response[0]`.
 
 ## System prompt
 
@@ -104,7 +102,7 @@ Current plant state. Each attack stage specifies the exact sensor to cite — do
 Generate suggestions for ATTACK stages only. Emit three direction cards per attack stage (or two if topology says "none" for one direction).
 ```
 
-Key construction choices (see `buildQuery` and `pickTopDeviation` in `src/lib/suggestions-direct.js`):
+Key construction choices (see `buildQuery` and `pickTopDeviation` in `src/lib/server/suggestions.js`):
 
 - **One sensor per stage, pre-picked by z-score.** We compute `z = |value - mean| / std` against baselines from `swat_normal.csv` and hand Newton only the top-z sensor. Multiple sensor choices caused Newton to default to familiar names instead of the most-deviating one.
 - **Signal-strength annotation.** `(strong deviation)` / `(moderate)` / `(weak signal)` gives Newton a hint about confidence without letting it skip the card.
@@ -120,7 +118,7 @@ Newton returns:
 }
 ```
 
-The string should be a parseable JSON array. We strip code fences, extract the outermost `[ ... ]`, `JSON.parse` it, and **topology-validate every item** — dropping any card whose `target` doesn't match the required mapping for its `origin` + `direction`. See `parseSuggestions` in `src/lib/suggestions-direct.js`.
+The string should be a parseable JSON array. We strip code fences, extract the outermost `[ ... ]`, `JSON.parse` it, and **topology-validate every item** — dropping any card whose `target` doesn't match the required mapping for its `origin` + `direction`. See `parseSuggestions` in `src/lib/server/suggestions.js`.
 
 Example parsed output (4 attack stages × 3 cards each, minus 1 topology-excluded):
 
@@ -136,11 +134,7 @@ Example parsed output (4 attack stages × 3 cards each, minus 1 topology-exclude
 
 ## End-to-end latency
 
-Measured on our account (browser → Newton direct, no retrieval, 6 stages state):
-
-- p50: ~3.5 s
-- p90: ~6 s
-- First request of a session: +1–2 s model warmup
+On production on 2026-11-13, one request for a single attack stage took about 10 s through `/api/suggestions`. Answers are cached by the set of anomalous stages, so a repeated set returns immediately.
 
 Fast enough to debounce on anomaly-set change and refetch whenever the set changes. We use a 1.5s debounce and drop overlapping requests.
 

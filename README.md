@@ -1,6 +1,6 @@
 # archetypeai-swat-demo-model-serving
 
-![SWaT six-stage dashboard with Omega embedding PCA view](images/swat-direct-query-pca.png)
+![SWaT six-stage dashboard with Omega embedding PCA view](images/swat-pca.png)
 
 A water treatment plant paved with sensors: **Newton Omega 1.5** embeds each stage's sensor window and a local KNN detects per-stage anomalies in real time, and **Newton C 2.6** suggests upstream and downstream actions to an operator. Both models are called through the Archetype AI **Inference API**.
 
@@ -153,7 +153,7 @@ POST /api/inference/query
 
 Collapsed by default — click "Omega embeddings · 6-stage 2D projection" at the bottom to expand. Six small scatters, one per stage. Mode toggle: **PCA** vs **UMAP**.
 
-![UMAP view of the embedding panel](images/swat-direct-query-umap.png)
+![UMAP view of the embedding panel](images/swat-umap.png)
 
 Three layers per scatter:
 

@@ -58,7 +58,7 @@
 		fill="currentColor"
 		stroke="none"
 		font-size="9"
-		font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+		font-family="'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace"
 	>
 		RAW
 	</text>
@@ -71,7 +71,7 @@
 		fill="currentColor"
 		stroke="none"
 		font-size="9"
-		font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+		font-family="'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace"
 	>
 		TREATED
 	</text>
@@ -164,7 +164,7 @@
 			stroke="none"
 			text-anchor="middle"
 			font-size="11"
-			font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+			font-family="'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace"
 		>
 			{s.id}
 		</text>
@@ -176,7 +176,7 @@
 			stroke="none"
 			text-anchor="middle"
 			font-size="9"
-			font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+			font-family="'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace"
 		>
 			{s.name}
 		</text>
