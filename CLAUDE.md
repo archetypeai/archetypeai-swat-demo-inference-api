@@ -44,21 +44,17 @@ Standard Tailwind is fine for:
 - **Variants**: `tailwind-variants` (tv) for component variants
 - **Slots**: `{@render children?.()}`
 
-## Pattern Registry
+## Design system packages
 
-Before building a new component, fetch the pattern catalog from:
-`https://design-system.archetypeai.workers.dev/r/patterns.json`
+The Archetype AI design system ships as npm packages: `@archetypeai/ds-lib-tokens` (tokens and theme, used here), `@archetypeai/ds-ui-svelte-console` and `@archetypeai/ds-ui-svelte-labs` (Svelte components), with the `@archetypeai/ds-cli` scaffolding CLI. Before building a new component, check whether those packages or `$lib/components/ui/` already have it. The [`atai-design-system`](https://github.com/archetypeai/agent-skills/tree/main/skills/atai-design-system) agent skill covers how to use them.
 
-Each entry includes a `name`, `title`, `description`, and `registryDependencies`. Reuse or extend existing patterns instead of rebuilding from scratch.
-
-Before installing, check if the pattern already exists locally in `$lib/components/ui/patterns/{name}/`. Only install if it is missing:
-`npx shadcn-svelte@latest add https://design-system.archetypeai.workers.dev/r/{name}.json`
+Fonts: this repo uses Geist and Geist Mono (open source, from `@fontsource-variable`), not the design system's `fonts.css`; see `src/routes/layout.css`.
 
 ## Skills
 
 **Skill composition:** When building a demo on the Archetype AI APIs (this app calls Newton Omega 1.5 and Newton C 2.6 on the Inference API; see `src/lib/inference-client.js` and the [Archetype AI agent skills](https://github.com/archetypeai/agent-skills)):
 1. Use `@skills/create-dashboard` for the page layout (dashboard with Menubar)
-2. Fetch `https://design-system.archetypeai.workers.dev/r/patterns.json` and reuse existing patterns before creating new components
+2. Reuse components from the design system packages and `$lib/components/ui/` before creating new ones
 3. Apply `@rules/design-principles` aesthetic conventions (BackgroundCard for single-purpose cards, mono font for headers/numbers)
 4. Only include chart components if the user's request involves time-series or explicitly mentions charts
 
