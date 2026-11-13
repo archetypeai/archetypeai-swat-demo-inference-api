@@ -10,6 +10,7 @@ All measurements below were taken on production on 2026-11-13.
 - **Fewer calls:** 6 Omega queries per window instead of 40 (one per sensor). Building the n-shot library takes **5.4 minutes** for 1,128 queries, instead of 25–35 minutes for about 7,500.
 - **The API key no longer reaches the browser.** The Direct Query version returned `ATAI_API_KEY` from `/api/baselines` so the browser could call Newton for suggestions. Suggestions now go through the server's `/api/suggestions`, and that route is gone.
 - **New library:** Omega 1.5 embeddings aren't comparable with Omega 1.4 ones, so `data/knn-library.json` and `data/inference-sample.json` were rebuilt.
+- **Same detection:** on the same held-out windows, Omega 1.5 and Omega 1.4 flag no normal windows, fire their first flag at the same point after the attack starts, and flag about the same attack windows (38 and 36 of 59).
 - **The SWaT data is no longer committed.** It belongs to iTrust; the README explains how to download it and the prep scripts rebuild the CSVs.
 
 ## Direct Query API vs Inference API
@@ -60,11 +61,14 @@ Leave-one-out KNN accuracy (k=3) within each stage's library, as shown in the em
 
 `node scripts/eval-playback.js` over every non-overlapping 128-row window of `swat_playback.csv` (3,000 normal rows, then 30,000 attack rows). A window is flagged when any stage says ATTACK.
 
-|                                 | Omega 1.5, all 257 windows | Omega 1.5, every 4th window | Omega 1.4, every 4th window |
-| ------------------------------- | -------------------------- | --------------------------- | --------------------------- |
-| Normal windows flagged          | 0/23                       | 0/6                         | _pending_                   |
-| Attack windows flagged          | 149/234 (64%)              | 38/59                       | _pending_                   |
-| First flag after the transition | 1,480 rows                 | 1,608 rows                  | _pending_                   |
+|                                         | Omega 1.5, all 257 windows      | Omega 1.5, every 4th window | Omega 1.4, every 4th window |
+| --------------------------------------- | ------------------------------- | --------------------------- | --------------------------- |
+| Normal windows flagged                  | 0/23                            | 0/6                         | 0/6                         |
+| Attack windows flagged                  | 149/234 (64%)                   | 38/59                       | 36/59                       |
+| First flag after the transition         | 1,480 rows                      | 1,608 rows                  | 1,608 rows                  |
+| Attack windows flagged per stage, P1–P6 | 126 · 145 · 123 · 115 · 111 · 0 | 32 · 37 · 31 · 29 · 28 · 0  | 33 · 33 · 31 · 29 · 30 · 0  |
+
+On the same 65 windows the two versions agree closely: no false alarms, the same first flag, and two more attack windows flagged by Omega 1.5, mostly in P2. Omega 1.4 was scored with the Direct Query version's own library (built from the same training files and scaler) and its one-request-per-channel calls.
 
 ### Speed
 
@@ -72,6 +76,7 @@ Leave-one-out KNN accuracy (k=3) within each stage's library, as shown in the em
 | -------------------------------------------- | ------------------------ | --------------------------------------------------------- |
 | Library build (`--step=20`)                  | 25–35 min, ~7,500 calls  | **5.4 min**, 1,128 queries                                |
 | Inference sample (6,000 rows)                | not recorded             | **81 s**, 276 queries                                     |
+| Held-out eval, every 4th window (65 windows) | 2,462 s, ~2,600 calls    | **112 s**, 390 queries                                    |
 | One window, all six stages (`/api/classify`) | ~1.5–2 s                 | **~2.2 s** (6.8 s for the first, which opens the session) |
 
 ## Reproducing
