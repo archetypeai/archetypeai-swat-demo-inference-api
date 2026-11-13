@@ -179,7 +179,13 @@ The SWaT (Secure Water Treatment) dataset was created by [iTrust, Centre for Res
 
 ### Download
 
-Request the dataset from iTrust, or download the normal and attack CSVs from the [Kaggle mirror](https://www.kaggle.com/datasets/vishala28/swat-dataset-secure-water-treatment-system), and put them in `data/`. `scripts/convert_swat_data.py` accepts the usual file names (`SWaT_Dataset_Normal_v1.csv`, `SWaT_Dataset_Attack_v0.csv`, and a few variants). The Kaggle mirror is an individual's upload and states no licence of its own; iTrust's terms still apply.
+Request the dataset from iTrust, or download it from the [Kaggle mirror](https://www.kaggle.com/datasets/vishala28/swat-dataset-secure-water-treatment-system) (`normal.csv`, `attack.csv` and `merged.csv`, about 100 MB zipped), and put the CSVs in `data/`. With the Kaggle CLI and an API token:
+
+```bash
+kaggle datasets download -d vishala28/swat-dataset-secure-water-treatment-system -p data --unzip
+```
+
+`scripts/convert_swat_data.py` accepts the Kaggle names and iTrust's (`SWaT_Dataset_Normal_v1.csv`, `SWaT_Dataset_Attack_v0.csv`, and a few variants). From the Kaggle mirror, the two prep scripts reproduce byte for byte the CSVs this demo was built and evaluated on (checked 2026-11-13). The Kaggle mirror is an individual's upload and states no licence of its own; iTrust's terms still apply.
 
 ### Prep
 
