@@ -26,3 +26,8 @@ vite.config.ts.timestamp-*
 # Excluded from git because knn-library.json exceeds GitHub's 100 MB hard limit.
 data/knn-library.json
 data/inference-sample.json
+
+# SWaT data: not redistributed. Download it from iTrust (or the Kaggle mirror)
+# and build these with scripts/convert_swat_data.py and scripts/generate_labels.py.
+# See the README's Data section.
+data/*.csv

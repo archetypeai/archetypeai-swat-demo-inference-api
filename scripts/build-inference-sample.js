@@ -2,7 +2,8 @@
 // Build a sampled-inference embedding pool for the embedding-viz panel.
 //
 // Reads a slice of swat_raw_labeled.csv around the demo's playback offset,
-// embeds windows for each stage via Direct Query, and writes
+// embeds windows for each stage with Omega 1.5 (one session query per
+// stage window), and writes
 // data/inference-sample.json. The server projects these through the same
 // PCA-2 / UMAP-2 fitted on the n-shot library, so the viz panel can show
 // a dense "where real playback windows land" cloud in addition to the
@@ -12,10 +13,10 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import { OmegaSession, OMEGA_MODEL, apiBase } from '../src/lib/inference-client.js';
 
 // Global per-channel scaler shared with build-knn-library.js and the live
-// /api/classify path. Required — pre-normalizing with consistent stats
-// everywhere is what lets us pass normalize_input=false to Omega.
+// /api/classify path, so every window shares one reference frame.
 const SCALER_PATH = resolve('data/scaler.json');
 const SCALER = existsSync(SCALER_PATH) ? JSON.parse(readFileSync(SCALER_PATH, 'utf-8')) : null;
 if (!SCALER) {
@@ -49,7 +50,7 @@ const STAGE_COLUMNS = {
 	P6: ['FIT601', 'P602']
 };
 const STAGE_IDS = Object.keys(STAGE_COLUMNS);
-const MODEL = 'OmegaEncoder::omega_embeddings_1_4';
+const MODEL = OMEGA_MODEL;
 
 function loadEnv() {
 	const env = {};
@@ -104,51 +105,20 @@ function majorityLabel(rows, labelIdx, startRow, windowSize) {
 	return attack > normal ? 'ATTACK' : 'NORMAL';
 }
 
-async function queryOmegaChannel(endpoint, apiKey, channel) {
-	const res = await fetch(endpoint, {
-		method: 'POST',
-		headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			query: '',
-			model: MODEL,
-			// Windows are pre-normalized with the global scaler before this call,
-			// so don't let Omega re-normalize per-window.
-			normalize_input: false,
-			events: [{ type: 'data.numeric_array', event_data: { contents: [channel] } }]
-		})
-	});
-	if (!res.ok) throw new Error(`/query ${res.status}: ${(await res.text()).slice(0, 300)}`);
-	const data = await res.json();
-	const vec = data.response?.response;
-	if (!Array.isArray(vec) || typeof vec[0] !== 'number') {
-		throw new Error('bad shape');
-	}
-	return vec; // flat 768
-}
-
-// Per-channel fan-out (Omega skill convention), concatenated in channel order —
-// matches how the KNN library is built so projections line up.
-async function queryOmega(endpoint, apiKey, channelFirstWindow) {
-	return Promise.all(channelFirstWindow.map((ch) => queryOmegaChannel(endpoint, apiKey, ch)));
-}
-
-function flatten2D(arr) {
-	const rows = arr.length;
-	const cols = arr[0].length;
-	const out = new Array(rows * cols);
-	for (let r = 0; r < rows; r++) {
-		for (let c = 0; c < cols; c++) {
-			out[r * cols + c] = arr[r][c];
-		}
-	}
-	return out;
-}
+// The Omega session, cancelled when the script ends or fails (an organization
+// may hold 16 open sessions on the model).
+let session = null;
 
 async function main() {
 	const env = loadEnv();
 	const args = parseArgs();
-	const endpoint = env.ATAI_API_ENDPOINT.replace(/\/$/, '') + '/api/lens/query';
-	console.log(`Endpoint: ${endpoint}`);
+	console.log(`Endpoint: ${apiBase(env.ATAI_API_ENDPOINT)}  model: ${MODEL}`);
+	session = new OmegaSession({
+		endpoint: env.ATAI_API_ENDPOINT,
+		apiKey: env.ATAI_API_KEY,
+		windowSize: args.window,
+		maxInFlight: 6
+	});
 	console.log(`Offset ${args.offset}, slice ${args.rows} rows, window=${args.window}, step=${args.step}`);
 
 	const { headers, rows } = readCsvSlice(
@@ -170,36 +140,21 @@ async function main() {
 		const embeddings = [];
 		const numWindows = Math.floor((rows.length - args.window) / args.step) + 1;
 		console.log(`\n${stageId} (${cols.length} cols): ${numWindows} windows`);
+		const windows = [];
 		for (let i = 0; i < numWindows; i++) {
 			const start = i * args.step;
-			const win = extractWindow(rows, idx, start, args.window);
-			const scaled = applyScaler(win, cols);
-			const truth = majorityLabel(rows, labelIdx, start, args.window);
-			let attempt = 0;
-			while (true) {
-				try {
-					const emb2d = await queryOmega(endpoint, env.ATAI_API_KEY, scaled);
-					embeddings.push({
-						vec: flatten2D(emb2d),
-						label: truth,
-						rowOffset: args.offset + start
-					});
-					break;
-				} catch (err) {
-					attempt += 1;
-					if (attempt >= 3) throw err;
-					await new Promise((r) => setTimeout(r, 500 * attempt));
-				}
-			}
-			if ((i + 1) % 10 === 0 || i === numWindows - 1) {
-				process.stdout.write(`  ${i + 1}/${numWindows}\r`);
-			}
+			windows.push({ start, truth: majorityLabel(rows, labelIdx, start, args.window) });
 		}
-		const aN = embeddings.filter((e) => e.label === 'NORMAL').length;
-		const aA = embeddings.filter((e) => e.label === 'ATTACK').length;
-		console.log(`  done: ${aN} NORMAL + ${aA} ATTACK`);
+		const vecs = await Promise.all(
+			windows.map(({ start }) => session.embed(applyScaler(extractWindow(rows, idx, start, args.window), cols)))
+		);
+		for (let i = 0; i < windows.length; i++) {
+			embeddings.push({ vec: Array.from(vecs[i]), label: windows[i].truth, rowOffset: args.offset + windows[i].start });
+		}
 		stages[stageId] = { columns: cols, embeddings };
 	}
+
+	await session.close();
 
 	const out = {
 		config: {
@@ -218,7 +173,8 @@ async function main() {
 	console.log(`\nWrote ${outPath} (${sizeMb} MB) in ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
 	console.error('FATAL:', err);
+	await session?.close();
 	process.exit(1);
 });

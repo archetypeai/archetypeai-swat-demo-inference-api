@@ -1,13 +1,10 @@
-import { json } from '@sveltejs/kit';
-import { ATAI_API_ENDPOINT, ATAI_API_KEY } from '$env/static/private';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
-// One-time per-sensor baselines computed from swat_normal.csv. The client
-// fetches these once on mount and uses them to build the Newton /query prompt
-// without going through SvelteKit's server route handler.
+// Per-sensor baselines (mean and std) computed once from swat_normal.csv, so the
+// suggestions prompt can tell Newton what normal looks like for each sensor.
 let BASELINES = null;
-function loadBaselines() {
+export function loadBaselines() {
 	if (BASELINES) return BASELINES;
 	try {
 		const csv = readFileSync(resolve('data/swat_normal.csv'), 'utf-8');
@@ -40,13 +37,4 @@ function loadBaselines() {
 		BASELINES = {};
 	}
 	return BASELINES;
-}
-loadBaselines();
-
-// apiKey is exposed here so the browser can call Newton's /query directly for
-// operator suggestions, mirroring the workaround used in the Lens-based version
-// (server-side /query was getting wedged in dev). Same trust boundary as before
-// — the key was already returned from /api/session/one in the original demo.
-export async function GET() {
-	return json({ baselines: BASELINES, endpoint: ATAI_API_ENDPOINT, apiKey: ATAI_API_KEY });
 }

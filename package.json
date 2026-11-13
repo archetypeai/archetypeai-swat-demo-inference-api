@@ -1,5 +1,5 @@
 {
-	"name": "newton-swat-demo",
+	"name": "archetypeai-swat-demo-model-serving",
 	"private": true,
 	"version": "0.0.1",
 	"type": "module",

@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// Build the n-shot KNN library used by the Direct Query classifier.
+// Build the n-shot KNN library used by the classifier.
 //
 // For each of the 6 SWaT stages, this slides a window across swat_normal.csv
-// and swat_attack.csv, sends each window (channel-first 2D) to Newton's /query
-// Omega endpoint, and stores the returned embeddings labeled NORMAL / ATTACK.
+// and swat_attack.csv, embeds each window (all of the stage's channels in one
+// query) with Newton Omega 1.5 through an Inference API session whose
+// window_size is the window length, and stores the embeddings labeled
+// NORMAL / ATTACK.
 //
 // Output: data/knn-library.json
 //   {
@@ -23,11 +25,10 @@
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
+import { OmegaSession, OMEGA_MODEL, apiBase } from '../src/lib/inference-client.js';
 
-// Global per-channel scaler. Without this, /query is called with
-// normalize_input=true which normalizes per-window and erases cross-window
-// amplitude signal. With this scaler we normalize once with the same fixed
-// stats everywhere and pass normalize_input=false to Omega.
+// Global per-channel scaler, shared with the server's classify path, so the
+// library and live windows share one reference frame.
 const SCALER_PATH = resolve('data/scaler.json');
 const SCALER = existsSync(SCALER_PATH) ? JSON.parse(readFileSync(SCALER_PATH, 'utf-8')) : null;
 if (!SCALER) {
@@ -61,7 +62,7 @@ const STAGE_COLUMNS = {
 	P6: ['FIT601', 'P602']
 };
 const STAGE_IDS = Object.keys(STAGE_COLUMNS);
-const MODEL = 'OmegaEncoder::omega_embeddings_1_4';
+const MODEL = OMEGA_MODEL;
 
 function loadEnv() {
 	const env = {};
@@ -103,87 +104,38 @@ function extractWindow(rows, headerIdx, startRow, windowSize) {
 	return out;
 }
 
-// One single-channel /query (flat 768-d response). Retried by the caller.
-async function queryOmegaChannel(endpoint, apiKey, channel) {
-	const res = await fetch(endpoint, {
-		method: 'POST',
-		headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			query: '',
-			model: MODEL,
-			// We pre-normalize with the global StandardScaler before sending, so
-			// Omega should NOT normalize per-window — that would erase the
-			// cross-window amplitude signal we just preserved.
-			normalize_input: false,
-			events: [{ type: 'data.numeric_array', event_data: { contents: [channel] } }]
-		})
-	});
-	if (!res.ok) {
-		const err = await res.text();
-		throw new Error(`/query failed: ${res.status} ${err.slice(0, 300)}`);
-	}
-	const data = await res.json();
-	const vec = data.response?.response;
-	if (!Array.isArray(vec) || typeof vec[0] !== 'number') {
-		throw new Error(`unexpected response shape: ${JSON.stringify(data).slice(0, 300)}`);
-	}
-	return vec; // flat 768
-}
-
-// Per the Omega skill: embed each channel with its own /query (fanned out in
-// parallel), then concatenate in channel order into the joint feature vector.
-async function queryOmega(endpoint, apiKey, channelFirstWindow) {
-	const perChannel = await Promise.all(
-		channelFirstWindow.map((channel) => queryOmegaChannel(endpoint, apiKey, channel))
-	);
-	return perChannel; // [num_channels x 768]
-}
-
-function flatten2D(arr) {
-	const rows = arr.length;
-	const cols = arr[0].length;
-	const out = new Array(rows * cols);
-	for (let r = 0; r < rows; r++) {
-		for (let c = 0; c < cols; c++) {
-			out[r * cols + c] = arr[r][c];
-		}
-	}
-	return out;
-}
-
-async function buildForStage(stageId, csvSets, headerIdxByLabel, endpoint, apiKey, windowSize, stepSize) {
+async function buildForStage(stageId, csvSets, headerIdxByLabel, session, windowSize, stepSize) {
 	const embeddings = [];
 	const stageColumns = STAGE_COLUMNS[stageId];
 	for (const { label, csv } of csvSets) {
 		const headerIdx = headerIdxByLabel[label];
 		const rows = csv.rows;
-		const total = rows.length;
-		for (let start = 0; start + windowSize <= total; start += stepSize) {
-			const win = extractWindow(rows, headerIdx, start, windowSize);
-			const scaled = applyScaler(win, stageColumns);
-			let attempt = 0;
-			while (true) {
-				try {
-					const emb2d = await queryOmega(endpoint, apiKey, scaled);
-					embeddings.push({ label, vec: flatten2D(emb2d) });
-					break;
-				} catch (err) {
-					attempt += 1;
-					if (attempt >= 6) throw err;
-					await new Promise((r) => setTimeout(r, 1000 * attempt));
-				}
-			}
-		}
-		console.log(`  ${stageId} ${label}: ${embeddings.filter((e) => e.label === label).length} windows`);
+		const starts = [];
+		for (let start = 0; start + windowSize <= rows.length; start += stepSize) starts.push(start);
+		// The session's pool caps how many queries run at once; retries live in the client.
+		const vecs = await Promise.all(
+			starts.map((start) => session.embed(applyScaler(extractWindow(rows, headerIdx, start, windowSize), stageColumns)))
+		);
+		for (const vec of vecs) embeddings.push({ label, vec: Array.from(vec) });
+		console.log(`  ${stageId} ${label}: ${vecs.length} windows`);
 	}
 	return embeddings;
 }
 
+// The Omega session, cancelled when the script ends or fails (an organization
+// may hold 16 open sessions on the model).
+let session = null;
+
 async function main() {
 	const env = loadEnv();
 	const args = parseArgs();
-	const endpoint = env.ATAI_API_ENDPOINT.replace(/\/$/, '') + '/api/lens/query';
-	console.log(`Endpoint: ${endpoint}`);
+	console.log(`Endpoint: ${apiBase(env.ATAI_API_ENDPOINT)}  model: ${MODEL}`);
+	session = new OmegaSession({
+		endpoint: env.ATAI_API_ENDPOINT,
+		apiKey: env.ATAI_API_KEY,
+		windowSize: args.window,
+		maxInFlight: 6
+	});
 	console.log(`Window: ${args.window}, Step: ${args.step}`);
 
 	const normal = readCsv(resolve('data/swat_normal.csv'));
@@ -207,14 +159,14 @@ async function main() {
 				{ label: 'ATTACK', csv: attack }
 			],
 			{ NORMAL: normalIdx, ATTACK: attackIdx },
-			endpoint,
-			env.ATAI_API_KEY,
+			session,
 			args.window,
 			args.step
 		);
 		stages[stageId] = { columns: cols, embeddings };
 	}
 
+	await session.close();
 	const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
 	const lib = {
 		config: {
@@ -233,7 +185,8 @@ async function main() {
 	console.log(`\nWrote ${outPath} (${sizeMb} MB) in ${elapsed}s`);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
 	console.error('FATAL:', err);
+	await session?.close();
 	process.exit(1);
 });

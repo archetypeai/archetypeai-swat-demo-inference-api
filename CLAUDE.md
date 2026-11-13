@@ -56,7 +56,7 @@ Before installing, check if the pattern already exists locally in `$lib/componen
 
 ## Skills
 
-**Skill composition:** When building a demo that uses a Newton or Embedding API skill:
+**Skill composition:** When building a demo on the Archetype AI APIs (this app calls Newton Omega 1.5 and Newton C 2.6 on the Inference API; see `src/lib/inference-client.js` and the [Archetype AI agent skills](https://github.com/archetypeai/agent-skills)):
 1. Use `@skills/create-dashboard` for the page layout (dashboard with Menubar)
 2. Fetch `https://design-system.archetypeai.workers.dev/r/patterns.json` and reuse existing patterns before creating new components
 3. Apply `@rules/design-principles` aesthetic conventions (BackgroundCard for single-purpose cards, mono font for headers/numbers)
@@ -71,15 +71,6 @@ Read these when relevant to your task:
 - `@skills/fix-accessibility` - audit and fix a11y issues
 - `@skills/fix-metadata` - update page titles, favicons, and OG tags
 - `@skills/deploy-worker` - deploy SvelteKit projects to Cloudflare Workers
-- `@skills/embedding-from-file` - run an Embedding Lens by streaming sensor data from a CSV file
-- `@skills/embedding-from-sensor` - run an Embedding Lens by streaming real-time data from a physical sensor
-- `@skills/embedding-upload` - run an Embedding Lens by uploading a CSV file for server-side processing
-- `@skills/newton-activity-monitor-lens-on-video` - analyze uploaded video files using Newton's activity monitor lens
-- `@skills/newton-camera-frame-analysis` - live webcam frame analysis using Newton's vision model
-- `@skills/newton-direct-query` - simple direct query to Newton model using the /query API endpoint
-- `@skills/newton-machine-state-from-file` - run a Machine State Lens by streaming sensor data from a CSV file
-- `@skills/newton-machine-state-from-sensor` - run a Machine State Lens by streaming real-time data from a physical sensor
-- `@skills/newton-machine-state-upload` - run a Machine State Lens by uploading a CSV file for server-side processing
 
 ## Rules
 

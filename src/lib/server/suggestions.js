@@ -1,7 +1,6 @@
-// Direct-to-Newton suggestions path. Bypasses SvelteKit's server route entirely
-// because our dev server handler was getting wedged on /query calls (probe
-// script proved Newton itself responds in 3-6s). The browser calls Newton's
-// /query endpoint directly using the API key returned from /api/session/one.
+// Operator suggestions: the prompt Newton C 2.6 gets for the anomalous stages,
+// and the parser that validates its JSON answer against the plant topology.
+// Server-only, used by /api/suggestions, so the API key never reaches the browser.
 
 const TOPOLOGY = {
 	P1: { upstream: null, local: 'P1', downstream: 'P2' },
@@ -21,7 +20,7 @@ const STAGE_NAMES = {
 	P6: 'backwash'
 };
 
-const SYSTEM_PROMPT = `You are an operator assistant for the SWaT six-stage water treatment plant. Flow: P1 raw intake → P2 chemical dosing → P3 ultrafiltration → P4 UV dechlorination → P5 reverse osmosis → treated water. P6 backwash recycles P5 reject to clean P3 UF membranes.
+export const SYSTEM_PROMPT = `You are an operator assistant for the SWaT six-stage water treatment plant. Flow: P1 raw intake → P2 chemical dosing → P3 ultrafiltration → P4 UV dechlorination → P5 reverse osmosis → treated water. P6 backwash recycles P5 reject to clean P3 UF membranes.
 
 For each stage marked ATTACK, suggest specific operator actions in three directions:
 - upstream: reduce or hold feed from the stage immediately before the anomalous one
@@ -55,14 +54,6 @@ Rules:
 - For upstream/downstream cards, the action text must name the TARGET stage by its Pn code.
 - Keep each "text" field under 140 characters.`;
 
-function formatBaseline(baselines, col) {
-	const b = baselines?.[col];
-	if (!b) return '';
-	const { mean, std } = b;
-	const precision = Math.abs(mean) >= 100 ? 0 : Math.abs(mean) >= 10 ? 1 : 2;
-	return `normal ${mean.toFixed(precision)}±${std.toFixed(precision + 1)}`;
-}
-
 // Pick the single most-deviating sensor per stage. Newton was ignoring our
 // z-ranking when given 3 choices and reverting to familiar sensor names, so we
 // do the selection server-side and hand it one sensor to cite.
@@ -79,7 +70,7 @@ function pickTopDeviation(stageSensors, baselines) {
 	return best;
 }
 
-function buildQuery(stageStatuses, stageSensors, baselines) {
+export function buildQuery(stageStatuses, stageSensors, baselines) {
 	const lines = Object.entries(STAGE_NAMES).map(([id, name]) => {
 		const status = (stageStatuses[id] ?? 'idle').toUpperCase();
 		let line = `- ${id} ${name}: ${status}`;
@@ -103,7 +94,7 @@ function repairKnownNewtonCorruptions(jsonText) {
 	return jsonText.replace(/(,\s*)\{"\{"/g, '$1{"').replace(/^\[\s*\{"\{"/g, '[{"');
 }
 
-function parseSuggestions(text) {
+export function parseSuggestions(text) {
 	if (!text) return null;
 	const cleaned = text
 		.replace(/^```(?:json)?\s*/i, '')
@@ -153,66 +144,4 @@ function parseSuggestions(text) {
 	} catch {
 		return null;
 	}
-}
-
-export async function fetchSuggestionsDirect({
-	apiKey,
-	endpoint,
-	baselines,
-	stageStatuses,
-	stageSensors
-}) {
-	if (!apiKey || !endpoint) throw new Error('Missing Newton credentials');
-	const anomalous = ['P1', 'P2', 'P3', 'P4', 'P5', 'P6']
-		.filter((id) => stageStatuses[id] === 'attack')
-		.sort();
-	const signature = anomalous.join(',') || 'none';
-	if (anomalous.length === 0) {
-		return { suggestions: [], source: 'newton', signature };
-	}
-
-	const url = endpoint.replace(/\/$/, '') + '/api/lens/query';
-	const body = {
-		query: buildQuery(stageStatuses, stageSensors, baselines),
-		// C 2.6 honors `instruction_prompt`; `system_prompt` is inert on it.
-		instruction_prompt: SYSTEM_PROMPT,
-		file_ids: [],
-		model: 'Newton::c2_6_8b_fp8_260424d7a55d5e',
-		max_new_tokens: 1500
-	};
-
-	const res = await fetch(url, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${apiKey}`,
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify(body)
-	});
-	if (!res.ok) {
-		const err = await res.text().catch(() => '');
-		throw new Error(`Newton /query ${res.status}: ${err.slice(0, 200)}`);
-	}
-	const data = await res.json();
-
-	// Unwrap response — Newton returns { response: { response: [string] } }
-	let raw = '';
-	if (data.response?.response && Array.isArray(data.response.response)) {
-		raw = data.response.response[0] || '';
-	} else if (Array.isArray(data.response)) {
-		raw = data.response[0] || '';
-	} else if (typeof data.response === 'string') {
-		raw = data.response;
-	} else if (data.text) {
-		raw = data.text;
-	}
-
-	const parsed = parseSuggestions(raw);
-	if (!parsed || parsed.length === 0) {
-		// Dump the raw response so we can see whether Newton returned malformed
-		// JSON or valid JSON whose suggestions all failed topology validation.
-		console.warn('[suggestions] error path, raw Newton response:', raw);
-		return { suggestions: [], source: 'error', signature, raw };
-	}
-	return { suggestions: parsed, source: 'newton', signature };
 }

@@ -1,14 +1,14 @@
-# newton-swat-demo-direct-query
+# archetypeai-swat-demo-model-serving
 
 ![SWaT six-stage dashboard with Omega embedding PCA view](images/swat-direct-query-pca.png)
 
-Feasibility demo: a water treatment plant paved with sensors, using **Newton's Direct Query API** for Omega embeddings + local KNN to detect per-stage anomalies in real time, and Newton text reasoning (also via Direct Query) to surface suggested upstream/downstream actions to an operator.
+A water treatment plant paved with sensors: **Newton Omega 1.5** embeds each stage's sensor window and a local KNN detects per-stage anomalies in real time, and **Newton C 2.6** suggests upstream and downstream actions to an operator. Both models are called through the Archetype AI **Inference API**.
 
-Branched from [`newton-swat-demo`](https://github.com/archetypeai/newton-swat-demo), which used the Machine State Lens (SSE streaming, six parallel sessions). This branch removes the lens entirely:
+Moved from the [Direct Query version](https://github.com/archetypeai/archetypeai-swat-demo-direct-query) (Omega 1.4 and Newton C 2.6 on `/api/lens/query`). See [MIGRATION.md](MIGRATION.md) for what changed and how the two compare.
 
-- **Classification** uses Direct Query to Omega for embeddings, then K-nearest-neighbours against a precomputed n-shot embedding library — no lens registration, no SSE, no session lifecycle, no startup race conditions.
-- **Operator suggestions** still use Direct Query to Newton's reasoning model (unchanged).
-- **Embedding visualization panel** added: collapsed by default, surfaces the Omega 2D layout per stage (PCA-2 + UMAP-2) with a live cursor that follows the playback window.
+- **Classification**: Omega 1.5 embeddings from one Inference API session, then K-nearest-neighbours against a precomputed n-shot embedding library.
+- **Operator suggestions**: Newton C 2.6 on the Inference API, called from the server.
+- **Embedding visualization panel**: collapsed by default, shows the Omega 2D layout per stage (PCA-2 + UMAP-2) with a live cursor that follows the playback window.
 
 ## Concept
 
@@ -29,154 +29,125 @@ Svelte 5 + SvelteKit · Tailwind v4 · `@archetypeai/ds-lib-tokens` · bits-ui �
 
 ## Setup
 
+Requires Node 20+, Python 3 (standard library only, for the data prep), an Archetype AI API key, and the SWaT dataset.
+
 ```bash
+git clone https://github.com/archetypeai/archetypeai-swat-demo-model-serving.git
+cd archetypeai-swat-demo-model-serving
+
 cp .env.example .env
-# edit .env with your ATAI_API_KEY and ATAI_API_ENDPOINT
+# edit .env: ATAI_API_KEY, and ATAI_API_ENDPOINT if not production
 
 npm install
+```
 
-# One-time: compute per-channel mean/std over the n-shot training pool.
-node scripts/build-scaler.js
-# < 1 sec, writes data/scaler.json (~3 KB, committed).
+The project's `.env` takes precedence over `ATAI_*` variables exported in your shell (see `vite.config.js`), so a shell profile pointing at another deployment can't redirect the app.
 
-# One-time: build the n-shot embedding library used by KNN.
+### Data
+
+The SWaT dataset isn't included: it's distributed by iTrust, and this repo doesn't redistribute it. See [Data](#data) for where to get it. Put the two raw CSVs in `data/`, then:
+
+```bash
+python3 scripts/convert_swat_data.py   # → data/swat_raw_labeled.csv (the full labeled timeline)
+python3 scripts/generate_labels.py     # → data/swat_normal.csv, swat_attack.csv, swat_playback.csv
+```
+
+`data/scaler.json` (per-channel mean and standard deviation of the n-shot pool) is committed. To recompute it: `node scripts/build-scaler.js`.
+
+### Build the library, then run
+
+```bash
+# One-time: embed the n-shot library the KNN votes against.
 node scripts/build-knn-library.js --step=20
-# Embeds one /api/lens/query per channel (the Omega skill's convention): ~7,500 calls
-# (1,128 windows × their channels), ~25-35 min. Retries transient failures.
-# Output: data/knn-library.json (~115 MB, gitignored — rebuild locally).
+# 1,128 Omega queries (188 windows × 6 stages), about 5 minutes.
+# Output: data/knn-library.json (~110 MB, gitignored).
 
-# Optional: background scatter of held-out playback windows for the viz panel.
+# Optional: background dots of held-out playback windows for the embedding panel.
 node scripts/build-inference-sample.js --offset=1384098 --rows=6000
-# writes data/inference-sample.json (gitignored). Offset 1384098 = row 0 of the
-# held-out playback window, so the dots line up with what you actually replay.
+# 276 queries, under 2 minutes. Writes data/inference-sample.json (gitignored).
+# Offset 1384098 = row 0 of the held-out playback window, so the dots line up with what you replay.
 
 npm run dev
 ```
 
-Open the dev URL, press **Start analysis** (instant — no session warmup), then **Play** to replay the SWaT timeline at 10× real time and watch classifications stream in.
+Open the dev URL, press **Start analysis**, then **Play** to replay the SWaT timeline at 10× real time and watch classifications stream in. The first classification opens the Omega session and takes a few seconds; after that each window takes about 2 s for all six stages.
 
-## How the demo interacts with Newton
+To score the classifier on the held-out playback stream: `node scripts/eval-playback.js` (see [What the held-out numbers show](#what-the-held-out-numbers-show)).
 
-Three flows: **build** (offline, one-time), **classify** (per playback window), **reason** (when anomalies change).
+## How the demo uses the Inference API
 
-### At a glance
+Three flows: **build** (offline, one-time), **classify** (per playback window), **reason** (when anomalies change). All API calls go through `src/lib/inference-client.js`, which the server and the build scripts share.
 
-**Scaler phase (offline, one-time, `node scripts/build-scaler.js`):**
+**Scaler (offline, `node scripts/build-scaler.js`):** per-channel mean and standard deviation over `swat_normal.csv` + `swat_attack.csv`, saved to `data/scaler.json`. Every window is scaled with it before embedding, so the library and live windows share one reference frame.
 
-1. Read `swat_normal.csv` + `swat_attack.csv` (4,000 rows total per channel).
-2. Compute per-channel mean and standard deviation across the combined pool.
-3. Save to `data/scaler.json`. Used by every subsequent call to `/api/lens/query` so all windows share a common reference frame.
+**Library (offline, `node scripts/build-knn-library.js --step=20`):**
 
-**Build phase (offline, one-time, `node scripts/build-knn-library.js --step=20`):**
+1. Read `swat_normal.csv` and `swat_attack.csv` (2,000 rows each).
+2. Slide 128-row windows across each file with `step=20` (94 windows per class per stage, 188 per stage).
+3. For each window: scale it, then embed **all of the stage's channels in one query** to an Omega session whose `window_size` is 128. The answer is one row of `channels × 768` values, the per-channel vectors in channel order. Tag it `NORMAL` or `ATTACK` by the file it came from.
+4. Save to `data/knn-library.json`.
 
-1. Read `swat_normal.csv` (2,000 rows) and `swat_attack.csv` (2,000 rows).
-2. Slide 128-row windows across each file with `step=20` (overlapping → 94 windows per class per stage, 188 per stage total).
-3. For each window: apply the global scaler `(x − mean) / std` per channel, then embed it **one `/api/lens/query` per channel** (`model: OmegaEncoder, normalize_input: false`, fanned out in parallel) → concatenate the per-channel 768-d vectors into one `[num_channels × 768]` vector → tag it `NORMAL` or `ATTACK` based on which file it came from.
-4. Save all of these as `data/knn-library.json` (gitignored — exceeds GitHub's 100 MB cap; rebuilds in ~20 min).
-
-**Runtime (per playback window, `/api/classify`):**
+**Classify (per playback window, `/api/classify`):**
 
 1. Take the 128 rows under the playhead.
-2. Apply the same global scaler, then embed one `/api/lens/query` per channel (`model: OmegaEncoder, normalize_input: false`) and concatenate → the joint embedding for the live window.
-3. Compute Euclidean distance from this embedding to every embedding in the library.
-4. Pick the 3 closest. Majority vote of their labels → predicted class.
+2. For each stage, scale the stage's channels and embed them in one query to the server's Omega session (six queries per window, in parallel).
+3. Euclidean distance to every library embedding of that stage; majority vote of the 3 nearest → `NORMAL` or `ATTACK`.
+4. Project the embedding with the library's PCA-2 and UMAP-2 for the embedding panel.
 
-KNN doesn't "train" in the way a neural net does — the library *is* the model. The build phase just embeds the n-shot examples once and stores them with their labels; every runtime prediction is a distance lookup against that stored set.
+KNN doesn't "train" in the way a neural net does — the library _is_ the model. The build phase embeds the n-shot examples once and stores them with their labels; every runtime prediction is a distance lookup against that stored set.
 
-> **Normalization matters more than you'd expect.** Calling `/api/lens/query` with `normalize_input: true` makes Omega z-score each window in isolation, which erases cross-window amplitude signal — two windows where `LIT401` reads 574 vs 950 look identical to the encoder afterwards. Pre-normalizing with a global per-channel scaler and passing `normalize_input: false` preserves the relative magnitudes. This single change took library LOO accuracy from 47–89% per stage to **57–100%**: P2/P4/P5 hit 100%, P1/P3 hit 93%, P6 (only 2 sensors, mostly idle) is the lone laggard at 57%. This is the downstream pattern the official [`atai-newton-omega-model`](https://github.com/archetypeai/agent-skills/tree/main/skills/atai-newton-omega-model) skill prescribes: fit one per-channel scaler on the training pool and call `/api/lens/query` with `normalize_input=false`.
+**Reason (`/api/suggestions`):** whenever the set of anomalous stages changes, the browser posts the plant state to `/api/suggestions`. The server builds the prompt (with per-sensor baselines from `swat_normal.csv`), asks Newton C 2.6, validates the JSON cards against the plant topology, and caches the answer by the set of anomalous stages. The prompt and parser live in `src/lib/server/suggestions.js`. The API key stays on the server.
 
-> **Step size also matters.** The very first build used `step=128` (non-overlapping → 15 windows per class) and gave LOO of 30–63%. Bumping to `step=20` (94 windows per class) lifted that to 47–89%. Together with global normalization, we now sit at 57–100%.
+### The Omega session
 
-### Phase 1 — Build the n-shot KNN library (offline)
-
-```
-scripts/build-knn-library.js
-   │
-   ├── read data/swat_normal.csv (2,000 rows of normal operation)
-   ├── read data/swat_attack.csv (2,000 rows from attack periods)
-   ├── for each stage (P1..P6):
-   │     for each window (128 rows, step=20):
-   │         for each channel:  POST /api/lens/query { model: OmegaEncoder, events: [data.numeric_array (ONE channel)] }   (parallel)
-   │         ← flat 768-d vector per channel
-   │         concat in channel order → [num_channels × 768] vector, label NORMAL or ATTACK
-   │
-   └── write data/knn-library.json
-       { stages: { P1: { columns, embeddings: [{ label, vec }, ...] }, ... } }
-```
-
-Per-stage library: 94 NORMAL + 94 ATTACK embeddings (step=20). Replaces the lens-internal KNN bank.
-
-### Phase 2 — Classify (every 128 rows during playback)
-
-```
-Browser tick loop                  SvelteKit /api/classify        Newton /api/lens/query
-   │                                       │                            │
-   │  every STEP_SIZE rows (128):          │                            │
-   │  POST /api/classify { rows: [...] }   │                            │
-   │  ────────────────────────────────────▶│                            │
-   │                                       │  Promise.allSettled:       │
-   │                                       ├── stage P1 → embed window ▶│
-   │                                       ├── stage P2 → embed window ▶│
-   │                                       ├── ... P3 P4 P5 P6 ────────▶│
-   │                                       │◀── embeddings ─────────────│
-   │                                       │                            │
-   │                                       │  for each stage:           │
-   │                                       │    local euclidean KNN     │
-   │                                       │    (k=3) against library   │
-   │                                       │    → label NORMAL|ATTACK   │
-   │                                       │    project via PCA-2       │
-   │                                       │    project via umap-js     │
-   │                                       │                            │
-   │◀── { stages: { P1: { label,           │                            │
-   │     neighbors, coords:{pca,umap} },   │                            │
-   │     ... } } ──────────────────────────│                            │
-   │                                       │                            │
-   │  update stage cards · update trail in │                            │
-   │  embedding panel                       │                            │
-```
-
-No session lifecycle. Each tick is a single round-trip to `/api/classify` that fans out to six parallel `/query` calls inside the server. End-to-end latency ~1.5–2 s for all six stages.
-
-### Phase 3 — Reason (Suggested Actions via Newton `/query`)
-
-Whenever the set of anomalous stages changes, the browser calls Newton's `/query` endpoint directly with a structured plant-state snapshot and gets back JSON cards routed to the correct upstream/local/downstream neighbour. The system prompt, request shape, and parser live in `src/lib/suggestions-direct.js`; the same fallback server route at `src/routes/api/suggestions/+server.js` exists too. Both call the **C 2.6** fusion model with `instruction_prompt` only, per the `atai-newton-fusion-model` skill.
-
-### Inside the Omega Direct Query call
-
-Per the Omega skill's recommended convention, each window is embedded **one request per channel**, fanned out in parallel — `contents` carries a single channel. (The API also accepts all channels in one request, but the per-channel and all-in-one conventions yield slightly different vectors, so the KNN library is built the same per-channel way to keep them consistent.) The Direct Query body shape (per stage, per window, per channel):
+The server opens one session on `omega-embedding` the first time it classifies a window, and reuses it for every stage:
 
 ```json
+POST /api/inference/sessions
+{ "model": "omega-embedding", "values": { "window_size": 128, "step_size": 128 } }
+```
+
+Each query carries one stage's window, channel first:
+
+```json
+POST /api/inference/sessions/{id}/query
 {
+  "model": "omega-embedding",
   "query": "",
-  "model": "OmegaEncoder::omega_embeddings_1_4",
-  "normalize_input": false,
   "events": [
-    {
-      "type": "data.numeric_array",
-      "event_data": { "contents": [[/* ONE channel: window_size values */]] }
-    }
+    { "type": "data.numeric_array", "event_data": { "contents": [[/* channel 1: 128 values */], [/* channel 2 */], "..."] } }
   ]
 }
 ```
 
-The app uses two models against the `/query` endpoint:
-
-- **`OmegaEncoder::omega_embeddings_1_4`** for per-window classification embeddings. Picked over `omega_embeddings_01` after a side-by-side leave-one-out comparison: P1 93→98%, P3 93→97%, no regressions on the other stages.
-- **`Newton::c2_6_8b_fp8_260424d7a55d5e`** — the C 2.6 fusion model, per the official [`atai-newton-fusion-model`](https://github.com/archetypeai/agent-skills/tree/main/skills/atai-newton-fusion-model) skill — for operator-suggestion JSON, called with `instruction_prompt` only (C 2.6 ignores the legacy `system_prompt`).
-
-Two helper scripts in `scripts/` let you re-run those comparisons on your own setup: `compare_omega_models.py` (the Omega encoder pair) and `compare-newton-models.js` (the Newton C pair on the actual suggestions prompt).
-
-Response — a single-channel request returns its 768-d vector **flat**:
+and the answer is one row per window:
 
 ```json
 {
-  "response": {
-    "response": [/* 768 values for this one channel */]
-  }
+	"response": {
+		"success": true,
+		"response": [
+			[
+				/* channels × 768 values */
+			]
+		]
+	}
 }
 ```
 
-The per-channel vectors are concatenated in channel order into one `[num_channels × 768]` vector per window before running KNN. The same vector is used for PCA-2 and `umap.transform()` to produce the embedding-panel coords.
+Things the client handles (`OmegaSession` in `src/lib/inference-client.js`):
+
+- **Exactly one window per query.** Input shorter than `window_size` comes back as `success: false` with no message, so the client checks each channel's length before sending.
+- **Sessions end.** A session ends when it expires or the model is redeployed, and then answers `409 session_not_running`; the client opens a new one and resends.
+- **Session limit.** An organization can hold 16 open sessions on the model. The server cancels its session when it stops (`npm run dev` and Ctrl-C included), and the build scripts cancel theirs when they finish or fail.
+- **Normalization.** Omega 1.5 standardizes each window itself and passes the window's original scale to the encoder; the shared scaler above still puts the library and live windows in one reference frame.
+
+Newton C 2.6 is a plain query, no session:
+
+```json
+POST /api/inference/query
+{ "model": "newton-c-2.6", "query": "...", "instruction_prompt": "...", "max_new_tokens": 1500 }
+```
 
 ## Embedding panel
 
@@ -186,7 +157,7 @@ Collapsed by default — click "Omega embeddings · 6-stage 2D projection" at th
 
 Three layers per scatter:
 
-- **Faint dots** — inference-timeline windows (build with `node scripts/build-inference-sample.js`), coloured by their ground-truth `normal`/`attack` label from `swat_raw_labeled.csv`. Shows where actual playback windows land in the embedding space, independent of what the library thinks.
+- **Faint dots** — inference-timeline windows (build with `node scripts/build-inference-sample.js`), coloured by their ground-truth `normal`/`attack` label from `swat_raw_labeled.csv`. Optional: it needs `swat_raw_labeled.csv`, which the data prep writes. Shows where actual playback windows land in the embedding space, independent of what the library thinks.
 - **Bright ringed dots** — the n-shot library examples KNN votes against (green = NORMAL, red = ATTACK).
 - **Large ringed circle with a gray trail** — the current playback window, projected through the same PCA / UMAP that was fit on the library.
 
@@ -198,77 +169,62 @@ Each scatter also shows a **LOO** badge: leave-one-out KNN accuracy in the full 
 
 Why not t-SNE: t-SNE has no `transform()` for new points by construction — adding the live cursor would force a refit on every tick, producing a totally different layout each time.
 
-## What's different vs the Lens version
-
-| Concern | Lens version (`newton-swat-demo`) | Direct Query version (this branch) |
-|---|---|---|
-| Setup phase | Upload n-shot files + 6 lens registrations + 6 session creates → 30–60 s warmup | None. Start analysis is instant; KNN library is built offline once. |
-| Classification | Push window into session → Newton SSE event → parse `inference.result` | Synchronous `POST /api/classify` → server fans out 6 `/query` calls + local KNN |
-| Failure modes | Sessions can stall mid-stream (`P4-stuck` scenario); SSE proxy/auth fragility; stale lenses from crashed tabs | Stateless. Each tick is independent. No cleanup needed. |
-| Embeddings | Hidden inside the lens | Returned by `/query` — exposed for visualization |
-| Code surface | `cleanStaleLenses`, `ensureNShotUploaded`, `waitForSession`, `streamWindowToStage`, SSE proxy route, session cleanup on `pagehide`, localStorage stale-ID cleanup | None of that. Server is ~200 lines for embed + KNN + projection. |
-| Per-window latency | ~1–2 s once warmed (SSE end-to-end) | ~1.5–2 s (6 parallel `/query` calls + KNN + projection) |
-| Cost per window | 6× Lens inference | 6× Direct Query `/query` |
-
-The two versions are basically equivalent at steady state; Direct Query trades the lens's batching + buffered streaming for stateless simplicity and exposed embeddings.
-
 ## Data
 
 ### Attribution
 
-The SWaT (Secure Water Treatment) dataset was created by [iTrust, Centre for Research in Cyber Security](https://itrust.sutd.edu.sg/) at the Singapore University of Technology and Design (SUTD). For published work, request the dataset through [iTrust's official channels](https://itrust.sutd.edu.sg/itrust-labs_datasets/).
+The SWaT (Secure Water Treatment) dataset was created by [iTrust, Centre for Research in Cyber Security](https://itrust.sutd.edu.sg/) at the Singapore University of Technology and Design (SUTD). It's distributed on request through [iTrust's official channels](https://itrust.sutd.edu.sg/itrust-labs_datasets/); request it there for published work.
 
 11 consecutive days of 1-second readings from a scaled-down but fully operational six-stage water treatment plant — 7 days of normal operation followed by 4 days with 36 cyber-physical attack scenarios.
 
-### Download (Kaggle mirror)
+### Download
 
-The fastest way to get started is the [Kaggle mirror of SWaT](https://www.kaggle.com/datasets/vishala28/swat-dataset-secure-water-treatment-system). Download the normal and attack CSVs and drop them in `data/`.
+Request the dataset from iTrust, or download the normal and attack CSVs from the [Kaggle mirror](https://www.kaggle.com/datasets/vishala28/swat-dataset-secure-water-treatment-system), and put them in `data/`. `scripts/convert_swat_data.py` accepts the usual file names (`SWaT_Dataset_Normal_v1.csv`, `SWaT_Dataset_Attack_v0.csv`, and a few variants). The Kaggle mirror is an individual's upload and states no licence of its own; iTrust's terms still apply.
 
 ### Prep
 
-The repo tracks the pre-processed outputs in `data/`:
+`scripts/convert_swat_data.py` merges the normal and attack CSVs, forward-fills missing SCADA values and drops 11 constant-value actuators, writing `data/swat_raw_labeled.csv`. `scripts/generate_labels.py` then writes:
 
-- `swat_raw_labeled.csv` — full labeled timeline (source for all splits below)
-- `swat_normal.csv` / `swat_attack.csv` — n-shot **training** examples (the KNN library)
-- `swat_playback.csv` — the **held-out** stream the demo replays (see Data split below)
-- `swat_quick_test_200.csv` — 200-row smoke test
-- `swat_inference.csv` — inference subset
-- `knn-library.json` — generated by `node scripts/build-knn-library.js`, not committed by default
+- `swat_normal.csv` / `swat_attack.csv` — n-shot **training** examples (the KNN library), 2,000 rows each
+- `swat_playback.csv` — the **held-out** stream the demo replays (see below)
 
-If you want to regenerate the CSVs from a fresh Kaggle download, see `scripts/convert_swat_data.py` and `scripts/generate_labels.py` — ported verbatim from [`archetypeai/archetypeai-batch-examples-swat`](https://github.com/archetypeai/archetypeai-batch-examples-swat).
+`swat_raw_labeled.csv` is only read again by `build-inference-sample.js`. Generated files (`knn-library.json`, `inference-sample.json`) and every CSV in `data/` are gitignored.
 
 ### Data split — leakage-free by construction
 
 Training (the n-shot KNN library) and playback (what the demo streams) come from **disjoint, contiguous time ranges**, so no played window is ever embedded into the library:
 
 - The timeline is one long **normal** block followed by one **attack** block.
-- **Training:** n-shot normal is drawn from the middle of the normal block; n-shot attack is drawn from a *later* slice of the attack block.
-- **Playback (`swat_playback.csv`):** a separate contiguous slice — a normal lead-in → the normal→attack transition → early attack — that ends *before* the attack n-shot slice (with a gap between).
+- **Training:** n-shot normal is drawn from the middle of the normal block; n-shot attack is drawn from a _later_ slice of the attack block.
+- **Playback (`swat_playback.csv`):** a separate contiguous slice — a normal lead-in → the normal→attack transition → early attack — that ends _before_ the attack n-shot slice (with a gap between).
 
 `scripts/generate_labels.py` carves these ranges (constants `PLAYBACK_NORMAL_LEAD`, `PLAYBACK_ATTACK_ROWS`, `NSHOT_ATTACK_GAP`) and **asserts** `playback ∩ n-shot = 0 rows` before writing — so the split can't silently regress. This is why playback reads its own file rather than seeking into the full timeline.
 
-### What the held-out numbers show (read this before trusting the detection)
+### What the held-out numbers show
 
-Once train and playback are genuinely disjoint, the demo's behavior is more honest — and more modest — than it first appears. Classifying held-out playback windows across all six stages:
+Once train and playback are genuinely disjoint, the demo's behaviour is more honest — and more modest — than it first appears. `node scripts/eval-playback.js` scores every non-overlapping 128-row window of the held-out playback stream the same way `/api/classify` does; a window counts as flagged when any stage says ATTACK. On production (Omega 1.5, 2026-11-13):
 
-- **Normal windows → no false positives.** Every normal window classifies NORMAL.
-- **Attacks are detected once they manifest, not the instant the label flips.** Early-attack windows (right after the transition) classify NORMAL; detection lights up (P1–P5 flagging) further into the attack period, on windows that resemble the disjoint attack examples in the library.
+|                                               | Result                                                  |
+| --------------------------------------------- | ------------------------------------------------------- |
+| Normal windows flagged (false alarms)         | **0 of 23**                                             |
+| Attack windows flagged                        | **149 of 234** (64%)                                    |
+| First flag after the normal→attack transition | **1,480 rows** (about 25 minutes of plant time at 1 Hz) |
+| Attack windows flagged per stage              | P1 126 · P2 145 · P3 123 · P4 115 · P5 111 · P6 0       |
 
-A window-size sweep confirms this isn't a tuning artifact — early-attack recall is flat across 128 / 256 / 512 (≈1/6 either way), so re-windowing doesn't recover it:
-
-```
-window   normal (FP)   early-attack recall
-   128       0/3              1/6
-   256       0/3              1/6
-   512       0/3              1/6
-```
+- **No false alarms on normal windows.**
+- **Attacks are detected once they manifest, not the instant the label flips.** The first windows after the transition classify NORMAL; detection lights up further into the attack period, on windows that resemble the disjoint attack examples in the library. The attack label covers the whole attack period, including stretches where no attack is active, so 64% is a floor on per-window recall rather than a miss rate.
+- **P6 never flags.** It has two sensors and is mostly idle; its library separates NORMAL from ATTACK no better than chance (LOO 50%).
 
 **Why:** n-shot KNN can only recognize attacks that resemble something in its library, and SWaT's attack period is heterogeneous — the early attacks we play are a different signature than the (disjoint) attacks the library was built from. You can't add the early attacks to the library without re-introducing leakage, because they only occur in the region we play.
 
-**The lesson this demo is meant to teach:** an earlier version drew its attack n-shot examples from the *same* rows it later replayed, so KNN was scoring played windows against near-copies of themselves — leakage that made detection look near-perfect. Removing it (the split above) reveals the true n-shot behavior. Treat the demo as *"detection fires as an attack grows into something the model has seen before,"* not as a perfect per-window detector. The **LOO badges** in the embedding panel measure separability *within the library* (a sanity check on the examples), which is a different and easier question than detecting genuinely unseen attacks.
+**The lesson this demo is meant to teach:** an earlier version drew its attack n-shot examples from the _same_ rows it later replayed, so KNN was scoring played windows against near-copies of themselves — leakage that made detection look near-perfect. Removing it (the split above) reveals the true n-shot behaviour. Treat the demo as _"detection fires as an attack grows into something the model has seen before,"_ not as a perfect per-window detector. The **LOO badges** in the embedding panel measure separability _within the library_ (a sanity check on the examples), which is a different and easier question than detecting genuinely unseen attacks.
 
 ## Scope caveats
 
-- Anomaly labels in SWaT are plant-wide, not per-stage. Each per-stage classifier is a best-effort inference based on *that stage's own sensors* — we're explicitly *not* looking at labels to decide which stage saw the attack.
+- Anomaly labels in SWaT are plant-wide, not per-stage. Each per-stage classifier is a best-effort inference based on _that stage's own sensors_ — we're explicitly _not_ looking at labels to decide which stage saw the attack.
 - The Suggested Actions panel is strictly Reason-layer: it surfaces operator guidance, never takes control actions. For any real deployment, actuation would require a separate safety-reviewed control path.
-- UMAP with 30 library points is a low-data regime; the layout is suggestive of structure but not precise. If you want sharper UMAP, increase the library by pre-embedding a chunk of inference data and including it in the fit set.
+- UMAP fitted on 188 library points per stage is a low-data regime; the layout is suggestive of structure but not precise. If you want sharper UMAP, increase the library by pre-embedding a chunk of inference data and including it in the fit set.
+
+## Licence
+
+The code is under the [Apache License 2.0](LICENSE). The SWaT dataset isn't included and isn't covered by it: it belongs to iTrust, SUTD, and is used under iTrust's terms (see [Data](#data)). `data/scaler.json` holds only per-channel summary statistics computed from it.

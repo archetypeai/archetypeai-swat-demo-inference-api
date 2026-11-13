@@ -2,11 +2,7 @@ import { ATAI_API_KEY, ATAI_API_ENDPOINT } from '$env/static/private';
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
 import { projectEmbedding } from './projections.js';
-
-// Every API surface lives under one versionless /api prefix, and the Direct
-// Query endpoint keeps its lens/ namespace.
-const API_PREFIX = 'api';
-const OMEGA_MODEL = 'OmegaEncoder::omega_embeddings_1_4';
+import { OmegaSession, queryNewton as queryNewtonModel } from '../inference-client.js';
 
 // SWaT stage → sensor column mapping. Identical to the original Lens-based demo
 // so the same n-shot files and KNN library work without conversion.
@@ -31,15 +27,12 @@ export const DEFAULT_CONFIG = {
 	nNeighbors: 3
 };
 
-function apiUrl(path) {
-	return `${ATAI_API_ENDPOINT.replace(/\/$/, '')}/${API_PREFIX}${path}`;
-}
-
 // ──────────────────────────────────────────────────────────────────────
 // Global per-channel StandardScaler (data/scaler.json). Loaded lazily.
-// Pre-normalizing every window with these fixed stats — and passing
-// normalize_input=false to Omega — preserves cross-window amplitude signal
-// that per-window normalization would erase. See scripts/build-scaler.js.
+// Omega 1.5 standardizes each window itself and passes the window's original
+// scale to the encoder, but every window is still scaled with these fixed
+// stats first, so the library and live windows share one reference frame.
+// See scripts/build-scaler.js.
 // ──────────────────────────────────────────────────────────────────────
 
 let SCALER = null;
@@ -104,113 +97,37 @@ export function getLibraryConfig() {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Direct Query: Omega embedding
+// Omega 1.5 embedding through one Inference API session
 // ──────────────────────────────────────────────────────────────────────
 
-const OMEGA_TIMEOUT_MS = 15000;
-
-async function postQuery(body, timeoutMs = OMEGA_TIMEOUT_MS) {
-	const controller = new AbortController();
-	const t = setTimeout(() => controller.abort(), timeoutMs);
-	try {
-		const res = await fetch(apiUrl('/lens/query'), {
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${ATAI_API_KEY}`,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify(body),
-			signal: controller.signal
+// One session for the whole server, at the demo's window length, kept on
+// globalThis so Vite's hot reload doesn't open a new one on every edit. All
+// stages share its in-flight cap. It is cancelled when the server stops; an
+// organization may hold 16 open sessions on the model.
+function getOmegaSession() {
+	const key = '__swatOmegaSession';
+	if (!globalThis[key]) {
+		const session = new OmegaSession({
+			endpoint: ATAI_API_ENDPOINT,
+			apiKey: ATAI_API_KEY,
+			windowSize: DEFAULT_CONFIG.windowSize,
+			maxInFlight: 6
 		});
-		if (!res.ok) {
-			const err = await res.text();
-			throw new Error(`/query failed: ${res.status} ${err.slice(0, 300)}`);
-		}
-		return res.json();
-	} finally {
-		clearTimeout(t);
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// Bounded per-channel fan-out (matches the Omega skill's thread-pool / `embed()`
-// pattern). We keep one /query per channel, but cap how many run at once so a
-// window's fan-out (e.g. 40 channels across 6 stages) doesn't overrun a
-// capacity-limited GPQ node. Each per-channel call also retries transient
-// failures (504 / timeout) instead of dropping the whole stage.
-// ──────────────────────────────────────────────────────────────────────
-
-const OMEGA_MAX_CONCURRENCY = 6;
-const OMEGA_RETRIES = 3;
-
-let omegaInFlight = 0;
-const omegaQueue = [];
-function withOmegaSlot(fn) {
-	return new Promise((resolve, reject) => {
-		const run = () => {
-			omegaInFlight++;
-			Promise.resolve()
-				.then(fn)
-				.then(resolve, reject)
-				.finally(() => {
-					omegaInFlight--;
-					const next = omegaQueue.shift();
-					if (next) next();
-				});
+		const stop = (signal) => {
+			session.close().finally(() => process.exit(signal === 'SIGINT' ? 130 : 143));
 		};
-		if (omegaInFlight < OMEGA_MAX_CONCURRENCY) run();
-		else omegaQueue.push(run);
-	});
-}
-
-// Embed a single channel (flat 768-d vector), retrying transient failures.
-async function embedChannel(channel) {
-	let lastErr;
-	for (let attempt = 0; attempt < OMEGA_RETRIES; attempt++) {
-		try {
-			const data = await postQuery({
-				query: '',
-				model: OMEGA_MODEL,
-				// Pre-normalized at the call site via applyScaler(); Omega should NOT
-				// re-normalize per-window or it would erase cross-window amplitude.
-				normalize_input: false,
-				events: [{ type: 'data.numeric_array', event_data: { contents: [channel] } }]
-			});
-			const vec = data.response?.response;
-			if (!Array.isArray(vec) || typeof vec[0] !== 'number') {
-				throw new Error(`unexpected Omega response shape: ${JSON.stringify(data).slice(0, 200)}`);
-			}
-			return vec;
-		} catch (err) {
-			lastErr = err;
-			if (attempt < OMEGA_RETRIES - 1) {
-				await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
-			}
-		}
+		process.once('SIGINT', () => stop('SIGINT'));
+		process.once('SIGTERM', () => stop('SIGTERM'));
+		globalThis[key] = session;
 	}
-	throw lastErr;
+	return globalThis[key];
 }
 
-// Send a [num_columns x window_size] channel-first array to Omega and return
-// the [num_columns x 768] embedding matrix, flattened to a single Float32Array
-// for KNN distance comparisons against the library.
+// Send a [num_columns x window_size] channel-first window to Omega in one
+// query and return the per-channel 768-d vectors concatenated in channel
+// order, as a single Float32Array for KNN against the library.
 export async function embedWindow(channelFirstWindow) {
-	// Per the Omega skill: one /query per channel. The calls fan out through a
-	// shared bounded pool (OMEGA_MAX_CONCURRENCY) so all stages in a window share
-	// the same in-flight cap; each is retried on transient failure. Concatenate
-	// the per-channel 768-d vectors in channel order into the joint KNN feature.
-	const perChannel = await Promise.all(
-		channelFirstWindow.map((channel) => withOmegaSlot(() => embedChannel(channel)))
-	);
-	const numChannels = perChannel.length;
-	const dim = perChannel[0].length;
-	const out = new Float32Array(numChannels * dim);
-	for (let c = 0; c < numChannels; c++) {
-		for (let d = 0; d < dim; d++) {
-			out[c * dim + d] = perChannel[c][d];
-		}
-	}
-	return out;
+	return getOmegaSession().embed(channelFirstWindow);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -260,7 +177,7 @@ function extractStageWindow(stageId, rows) {
 	);
 }
 
-// Run Direct Query → KNN for one stage. Returns the label, neighbors,
+// Run Omega → KNN for one stage. Returns the label, neighbors,
 // and the raw embedding (so the client can run PCA-2 projection for the
 // embedding-viz panel without re-querying Omega).
 export async function classifyStage(stageId, rows, { k = DEFAULT_CONFIG.nNeighbors } = {}) {
@@ -271,7 +188,7 @@ export async function classifyStage(stageId, rows, { k = DEFAULT_CONFIG.nNeighbo
 	// Project to 2D for the embedding-viz panel. Cheap (~10-50ms total for
 	// PCA + UMAP transform). If projection ever fails, the classification
 	// itself still returns — viz coords are best-effort.
-	let coords = null;
+	let coords;
 	try {
 		coords = await projectEmbedding(stageId, embedding);
 	} catch {
@@ -299,47 +216,15 @@ export async function classifyAllStages(rows, opts = {}) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Text reasoning Direct Query (used for operator suggestions, unchanged)
+// Newton C 2.6 text reasoning (operator suggestions)
 // ──────────────────────────────────────────────────────────────────────
 
-export function getApiKey() {
-	return ATAI_API_KEY;
-}
-
 export async function queryNewton({ query, systemPrompt = '', maxNewTokens = 1024 }) {
-	const controller = new AbortController();
-	const timeoutId = setTimeout(() => controller.abort(), 120000);
-	try {
-		const res = await fetch(apiUrl('/lens/query'), {
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${ATAI_API_KEY}`,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify({
-				query,
-				// C 2.6 honors `instruction_prompt`; the legacy `system_prompt`
-				// field is inert on this checkpoint, so we send only the former.
-				instruction_prompt: systemPrompt,
-				file_ids: [],
-				model: 'Newton::c2_6_8b_fp8_260424d7a55d5e',
-				max_new_tokens: maxNewTokens
-			}),
-			signal: controller.signal
-		});
-		if (!res.ok) {
-			const err = await res.json().catch(() => ({}));
-			throw new Error(`query failed: ${res.status} - ${JSON.stringify(err)}`);
-		}
-		const data = await res.json();
-		if (data.response?.response && Array.isArray(data.response.response)) {
-			return data.response.response[0] || '';
-		}
-		if (Array.isArray(data.response)) return data.response[0] || '';
-		if (typeof data.response === 'string') return data.response;
-		if (data.text) return data.text;
-		return '';
-	} finally {
-		clearTimeout(timeoutId);
-	}
+	return queryNewtonModel({
+		endpoint: ATAI_API_ENDPOINT,
+		apiKey: ATAI_API_KEY,
+		query,
+		instructionPrompt: systemPrompt,
+		maxNewTokens
+	});
 }

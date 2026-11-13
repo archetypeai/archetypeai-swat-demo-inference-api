@@ -4,7 +4,7 @@ Convert SWaT (Secure Water Treatment) dataset into a format suitable
 for the Archetype AI Machine State pipeline.
 
 Usage:
-    python 1_prepare_data/convert_swat_data.py
+    python scripts/convert_swat_data.py
 
 Reads the normal and attack CSV files from the Kaggle mirror, combines them,
 adds sequential timestamps, selects sensor/actuator columns, and writes a

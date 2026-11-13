@@ -13,7 +13,6 @@
 	import PlantSchematic from '$lib/components/ui/custom/plant-schematic.svelte';
 	import EmbeddingPanel from '$lib/components/ui/custom/embedding-panel.svelte';
 	import { fetchChunk, classifyWindow, fetchProjections, fetchSuggestions } from '$lib/api/swat.js';
-	import { fetchSuggestionsDirect } from '$lib/suggestions-direct.js';
 
 	// Mirrors src/lib/server/newton.js STAGE_COLUMNS; kept in sync manually.
 	const STAGE_COLUMNS = {
@@ -64,9 +63,10 @@
 	let streamCounter = $state(0);
 	let loadingChunk = $state(false);
 
-	// Direct Query is stateless — no sessions, no setup. "ready" means we've loaded
-	// the inference CSV chunk and projections; "classifying" appears transiently
-	// during in-flight /api/classify calls.
+	// Nothing to set up in the browser: the server opens its Omega session on the
+	// first classify call. "ready" means we've loaded the playback chunk and
+	// projections; "classifying" appears transiently during in-flight
+	// /api/classify calls.
 	let sessionStatus = $state('idle'); // idle | ready | error
 	let setupError = $state('');
 
@@ -92,9 +92,6 @@
 	let suggestionSignature = $state('');
 	let suggestionDebounce = null;
 	let suggestionFetchInFlight = false;
-	let newtonApiKey = $state(null);
-	let newtonEndpoint = $state(null);
-	let sensorBaselines = $state(null);
 
 	let effectiveStatuses = $derived.by(() => {
 		const out = { ...stageStatuses };
@@ -136,16 +133,6 @@
 	}
 
 	onMount(() => {
-		// One-time fetch of baselines + Newton creds for the direct-to-Newton suggestions path.
-		fetch('/api/baselines')
-			.then((r) => r.json())
-			.then((data) => {
-				sensorBaselines = data.baselines ?? null;
-				newtonEndpoint = data.endpoint ?? null;
-				newtonApiKey = data.apiKey ?? null;
-			})
-			.catch((err) => console.error('[baselines] failed:', err));
-
 		// Static library projection coords for the embedding panel. Background
 		// scatter. Live cursor is appended per classify response.
 		fetchProjections()
@@ -281,17 +268,10 @@
 		);
 
 		try {
-			const canCallDirect = newtonApiKey && newtonEndpoint && sensorBaselines;
-			const fetcher = canCallDirect
-				? fetchSuggestionsDirect({
-						apiKey: newtonApiKey,
-						endpoint: newtonEndpoint,
-						baselines: sensorBaselines,
-						stageStatuses: effectiveStatuses,
-						stageSensors
-					})
-				: fetchSuggestions(effectiveStatuses, stageSensors);
-			const result = await Promise.race([fetcher, timeoutPromise]);
+			const result = await Promise.race([
+				fetchSuggestions(effectiveStatuses, stageSensors),
+				timeoutPromise
+			]);
 			aiSuggestions = result.suggestions ?? [];
 			suggestionSource = result.source ?? 'error';
 			suggestionSignature = result.signature ?? sig;
@@ -330,7 +310,7 @@
 	});
 </script>
 
-<svelte:head><title>Newton · SWaT (Direct Query)</title></svelte:head>
+<svelte:head><title>Newton · SWaT (Inference API)</title></svelte:head>
 
 <a
 	href="#main-content"
@@ -341,7 +321,7 @@
 
 {#snippet partnerSnippet()}
 	<span class="text-muted-foreground font-mono text-sm tracking-wider uppercase">
-		SWaT · Direct Query · 6-stage water treatment
+		SWaT · Inference API · 6-stage water treatment
 	</span>
 {/snippet}
 
@@ -351,7 +331,7 @@
 	<Menubar partnerLogo={partnerSnippet}>
 		{#if sessionStatus === 'ready'}
 			<Badge variant="outline" class="text-atai-good font-mono">
-				Newton · Direct Query{classifyInFlight ? ' · classifying' : ' · ready'}
+				Newton · Inference API{classifyInFlight ? ' · classifying' : ' · ready'}
 			</Badge>
 			<Button variant="outline" size="sm" onclick={handleStop}>Stop</Button>
 		{:else if sessionStatus === 'error'}
@@ -378,7 +358,7 @@
 	</div>
 
 	<main id="main-content" class="grid min-h-0 grid-cols-[3fr_1fr] gap-4 overflow-hidden p-4" style="height: calc(100vh - 140px);">
-		<h1 class="sr-only">SWaT per-stage anomaly dashboard (Direct Query)</h1>
+		<h1 class="sr-only">SWaT per-stage anomaly dashboard (Inference API)</h1>
 
 		<div class="flex min-h-0 flex-col gap-3 overflow-hidden">
 			<section aria-label="Plant process flow" class="shrink-0">
