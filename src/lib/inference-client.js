@@ -89,6 +89,7 @@ export class OmegaSession {
 		this.timeoutMs = timeoutMs;
 		this.id = null;
 		this.opening = null;
+		this.closing = null;
 		this.inFlight = 0;
 		this.queue = [];
 	}
@@ -109,15 +110,23 @@ export class OmegaSession {
 		return this.opening;
 	}
 
-	async close() {
+	// Cancel the session. Callers that arrive while a cancel is in flight get
+	// the same promise, so every shutdown path can wait for the request to land.
+	close() {
 		const id = this.id;
 		this.id = null;
-		if (!id) return;
-		try {
-			await post(this.base, this.apiKey, `/inference/sessions/${id}/cancel`, undefined, 10000);
-		} catch {
-			// Best effort: a session that isn't cancelled ends on its own.
+		if (id) {
+			this.closing = post(
+				this.base,
+				this.apiKey,
+				`/inference/sessions/${id}/cancel`,
+				undefined,
+				10000
+			).catch(() => {
+				// Best effort: a session that isn't cancelled ends on its own.
+			});
 		}
+		return this.closing ?? Promise.resolve();
 	}
 
 	slot(fn) {
