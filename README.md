@@ -1,4 +1,4 @@
-# archetypeai-swat-demo-model-serving
+# archetypeai-swat-demo-inference-api
 
 ![SWaT six-stage dashboard with Omega embedding PCA view](images/swat-pca.png)
 
@@ -32,8 +32,8 @@ Svelte 5 + SvelteKit · Tailwind v4 · `@archetypeai/ds-lib-tokens` · bits-ui �
 Requires Node 20+, Python 3 (standard library only, for the data prep), an Archetype AI API key, and the SWaT dataset.
 
 ```bash
-git clone https://github.com/archetypeai/archetypeai-swat-demo-model-serving.git
-cd archetypeai-swat-demo-model-serving
+git clone https://github.com/archetypeai/archetypeai-swat-demo-inference-api.git
+cd archetypeai-swat-demo-inference-api
 
 cp .env.example .env
 # edit .env: ATAI_API_KEY, and ATAI_API_ENDPOINT if not production
